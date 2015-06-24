@@ -57,15 +57,11 @@ func TestGetServer(t *testing.T) {
 			continue
 		}
 		ip, port, handler, _, _ := GetServer(test.conf)
-		if proxy_handler, ok := handler.(ProxyHandler); ok {
-			assert.NotNil(t, net.ParseIP(ip))
-			assert.Equal(t, port, 8080)
-			assert.NotNil(t, proxy_handler.mc)
-			assert.NotNil(t, proxy_handler.client)
-			assert.NotNil(t, proxy_handler.logger)
-			assert.NotNil(t, proxy_handler.objectRing)
-			assert.NotNil(t, proxy_handler.accountRing)
-			assert.NotNil(t, proxy_handler.containerRing)
-		}
+		assert.NotNil(t, net.ParseIP(ip))
+		assert.Equal(t, port, 8080)
+		assert.NotPanics(t, func() {
+			_ = handler.(http.Handler)
+		})
+
 	}
 }

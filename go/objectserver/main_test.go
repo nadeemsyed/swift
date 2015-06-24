@@ -40,7 +40,7 @@ type TestServer struct {
 	host    string
 	port    int
 	root    string
-	handler *ObjectHandler
+	handler http.Handler
 }
 
 func (t *TestServer) Close() {
@@ -88,7 +88,7 @@ func makeObjectServer(settings ...string) (*TestServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TestServer{Server: ts, host: host, port: port, root: driveRoot, handler: handler.(*ObjectHandler)}, nil
+	return &TestServer{Server: ts, host: host, port: port, root: driveRoot, handler: handler}, nil
 }
 
 func TestSyncWorks(t *testing.T) {
