@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -33,17 +34,13 @@ import (
 #ifndef __O_TMPFILE
 #define __O_TMPFILE	020000000
 #endif
-
-#ifndef O_TMPFILE
-#define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
-#endif
 */
 import "C"
 
 var (
 	AT_FDCWD          = C.AT_FDCWD
 	AT_SYMLINK_FOLLOW = C.AT_SYMLINK_FOLLOW
-	O_TMPFILE         = C.O_TMPFILE
+	O_TMPFILE         = C.__O_TMPFILE | syscall.O_DIRECTORY
 	useOTempfile      = false
 )
 
@@ -84,6 +81,7 @@ func linkat(fd uintptr, dst string) error {
 // TempFile implements an atomic file writer using linux's O_TMPFILE/linkat mechanism if available, otherwise by writing to a temp directory and renaming.
 type TempFile struct {
 	*os.File
+	tempDir   string
 	dst       string
 	saved     bool
 	otempfile bool
@@ -108,10 +106,17 @@ func (o *TempFile) Save() error {
 	}
 	if o.otempfile {
 		if err := linkat(o.File.Fd(), o.dst); err != nil {
+			if err := os.MkdirAll(o.tempDir, 0770); err != nil {
+				return err
+			}
+			tmpLocation := filepath.Join(o.tempDir, fmt.Sprintf(".%016X", rand.Int63()))
+			if err := linkat(o.File.Fd(), tmpLocation); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(o.dst), 0770); err != nil {
 				return err
 			}
-			return linkat(o.File.Fd(), o.dst)
+			return os.Rename(tmpLocation, o.dst)
 		}
 	} else {
 		if err := os.MkdirAll(filepath.Dir(o.dst), 0755); err != nil {
@@ -150,7 +155,7 @@ func NewAtomicFileWriter(tempDir string, dst string) (AtomicFileWriter, error) {
 		}
 		tempFile, err := os.OpenFile(filepath.Dir(dst), O_TMPFILE|os.O_RDWR, 0660)
 		if err == nil {
-			return &TempFile{File: tempFile, dst: dst, saved: false, otempfile: true}, nil
+			return &TempFile{tempDir: tempDir, File: tempFile, dst: dst, saved: false, otempfile: true}, nil
 		}
 	}
 	if err := os.MkdirAll(tempDir, 0770); err != nil {
@@ -160,5 +165,5 @@ func NewAtomicFileWriter(tempDir string, dst string) (AtomicFileWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TempFile{File: tempFile, dst: dst, saved: false, otempfile: false}, nil
+	return &TempFile{tempDir: tempDir, File: tempFile, dst: dst, saved: false, otempfile: false}, nil
 }
