@@ -210,6 +210,7 @@ func listObjFiles(partdir string, needSuffix func(string) bool) ([]string, error
 	if len(suffixDirs) == 0 {
 		os.Remove(filepath.Join(partdir, ".lock"))
 		os.Remove(filepath.Join(partdir, "hashes.pkl"))
+		os.Remove(filepath.Join(partdir, "hashes.invalid"))
 		os.Remove(partdir)
 		return nil, nil
 	}
@@ -288,16 +289,25 @@ func (r *Replicator) syncFile(objFile string, dst []*syncFileArg) (syncs int, in
 	var totalRead int64
 	for length, err = fp.Read(scratch); err == nil; length, err = fp.Read(scratch) {
 		totalRead += int64(length)
-		for _, sfa := range wrs {
-			sfa.conn.Write(scratch[0:length])
+		for index, sfa := range wrs {
+			if sfa == nil {
+				continue
+			}
+			if _, err := sfa.conn.Write(scratch[0:length]); err != nil {
+				r.LogError("Failed to write to remoteDevice: %d, %v", sfa.dev.Id, err)
+				wrs[index] = nil
+			}
 		}
 	}
 	if totalRead != fileSize {
-		return 0, 0, fmt.Errorf("Failed to read the full file.")
+		return 0, 0, fmt.Errorf("Failed to read the full file: %s, %v", objFile, err)
 	}
 
 	// get file upload results
 	for _, sfa := range wrs {
+		if sfa == nil {
+			continue
+		}
 		var fur FileUploadResponse
 		sfa.conn.Flush()
 		if sfa.conn.RecvMessage(&fur) == nil {
