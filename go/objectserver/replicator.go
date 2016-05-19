@@ -182,7 +182,7 @@ func (r *Replicator) getFile(filePath string) (fp *os.File, xattrs []byte, size 
 }
 
 func (r *Replicator) beginReplication(dev *hummingbird.Device, partition string, hashes bool, rChan chan ReplicationData) {
-	rc, err := NewRepConn(dev.ReplicationIp, dev.ReplicationPort, dev.Device, partition)
+	rc, err := NewRepConn(dev, partition)
 	if err != nil {
 		r.LogError("[beginReplication] error creating new request: %v", err)
 		rChan <- ReplicationData{dev: dev, conn: nil, hashes: nil, err: err}
@@ -213,6 +213,10 @@ func listObjFiles(partdir string, needSuffix func(string) bool) ([]string, error
 		os.Remove(filepath.Join(partdir, "hashes.invalid"))
 		os.Remove(partdir)
 		return nil, nil
+	}
+	for i := len(suffixDirs) - 1; i > 0; i-- { // shuffle suffixDirs list
+		j := rand.Intn(i + 1)
+		suffixDirs[j], suffixDirs[i] = suffixDirs[i], suffixDirs[j]
 	}
 	for _, suffDir := range suffixDirs {
 		if !needSuffix(filepath.Base(suffDir)) {
