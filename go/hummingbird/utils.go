@@ -25,7 +25,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -36,111 +35,15 @@ import (
 	"time"
 
 	"github.com/cactus/go-statsd-client/statsd"
-	ini "github.com/vaughan0/go-ini"
 )
 
-var (
-	PathNotDirErrorCode = 1
-	OsErrorCode         = 2
-	NotMountedErrorCode = 3
-	LockPathError       = 4
-	UnhandledError      = 5
-	ONE_WEEK            = 604800
-)
-
-type BackendError struct {
-	Err  error
-	Code int
-}
-
-func (e BackendError) Error() string {
-	return fmt.Sprintf("%s ( %d )", e.Err, e.Code)
-}
+const ONE_WEEK = 604800
 
 type httpRange struct {
 	Start, End int64
 }
 
 var GMT *time.Location
-
-type IniFile struct{ ini.File }
-
-func (f IniFile) Get(section string, key string) (string, bool) {
-	if value, ok := f.File.Get(section, key); ok {
-		return value, true
-	} else if value, ok := f.File.Get("DEFAULT", key); ok {
-		return value, true
-	} else if value, ok := f.File.Get(section, "set "+key); ok {
-		return value, true
-	} else if value, ok := f.File.Get("DEFAULT", "set "+key); ok {
-		return value, true
-	}
-	return "", false
-}
-
-func (f IniFile) GetDefault(section string, key string, dfl string) string {
-	if value, ok := f.Get(section, key); ok {
-		return value
-	}
-	return dfl
-}
-
-func (f IniFile) GetBool(section string, key string, dfl bool) bool {
-	if value, ok := f.Get(section, key); ok {
-		return LooksTrue(value)
-	}
-	return dfl
-}
-
-func (f IniFile) GetInt(section string, key string, dfl int64) int64 {
-	if value, ok := f.Get(section, key); ok {
-		if val, err := strconv.ParseInt(value, 10, 64); err == nil {
-			return val
-		}
-		panic(fmt.Sprintf("Error parsing integer %s/%s from config.", section, key))
-	}
-	return dfl
-}
-
-func (f IniFile) GetLimit(section string, key string, dfla int64, dflb int64) (int64, int64) {
-	if value, ok := f.Get(section, key); ok {
-		fmt.Sscanf(value, "%d/%d", &dfla, &dflb)
-	}
-	return dfla, dflb
-}
-
-func (f IniFile) HasSection(section string) bool {
-	return f.File[section] != nil
-}
-
-func LoadIniFile(filename string) (IniFile, error) {
-	file := IniFile{make(ini.File)}
-	return file, file.LoadFile(filename)
-}
-
-func UidFromConf(serverConf string) (uint32, uint32, error) {
-	if ini, err := LoadIniFile(serverConf); err == nil {
-		username := ini.GetDefault("DEFAULT", "user", "swift")
-		usr, err := user.Lookup(username)
-		if err != nil {
-			return 0, 0, err
-		}
-		uid, err := strconv.ParseUint(usr.Uid, 10, 32)
-		if err != nil {
-			return 0, 0, err
-		}
-		gid, err := strconv.ParseUint(usr.Gid, 10, 32)
-		if err != nil {
-			return 0, 0, err
-		}
-		return uint32(uid), uint32(gid), nil
-	} else {
-		if matches, err := filepath.Glob(serverConf + "/*.conf"); err == nil && len(matches) > 0 {
-			return UidFromConf(matches[0])
-		}
-	}
-	return 0, 0, fmt.Errorf("Unable to find config file")
-}
 
 func WriteFileAtomic(filename string, data []byte, perm os.FileMode) error {
 	partDir := filepath.Dir(filename)
@@ -165,32 +68,39 @@ func WriteFileAtomic(filename string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-func LockPath(directory string, timeout int) (*os.File, error) {
-	sleepTime := 5
+// LockPath locks a directory with a timeout.
+func LockPath(directory string, timeout time.Duration) (*os.File, error) {
 	lockfile := filepath.Join(directory, ".lock")
 	file, err := os.OpenFile(lockfile, os.O_RDWR|os.O_CREATE, 0660)
 	if err != nil {
 		if os.IsNotExist(err) && os.MkdirAll(directory, 0755) == nil {
 			file, err = os.OpenFile(lockfile, os.O_RDWR|os.O_CREATE, 0660)
 		}
-		if file == nil {
-			return nil, errors.New(fmt.Sprintf("Unable to open file ccc. ( %s )", err.Error()))
+		if err != nil {
+			return nil, errors.New(fmt.Sprintf("Unable to open lock file (%v)", err))
 		}
 	}
-	for stop := time.Now().Add(time.Duration(timeout) * time.Second); time.Now().Before(stop); {
-		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	success := make(chan error)
+	cancel := make(chan struct{})
+	defer close(cancel)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	go func(fd int) {
+		select {
+		case success <- syscall.Flock(fd, syscall.LOCK_EX):
+		case <-cancel:
+		}
+	}(int(file.Fd()))
+	select {
+	case err = <-success:
 		if err == nil {
 			return file, nil
 		}
-		time.Sleep(time.Millisecond * time.Duration(sleepTime))
-		sleepTime += 5
+	case <-timer.C:
+		err = errors.New("Flock timed out")
 	}
 	file.Close()
-	return nil, errors.New("Timed out")
-}
-
-func LockParent(file string, timeout int) (*os.File, error) {
-	return LockPath(filepath.Dir(file), timeout)
+	return nil, err
 }
 
 func IsMount(dir string) (bool, error) {
@@ -440,7 +350,7 @@ func StandardizeTimestamp(timestamp string) (string, error) {
 
 func IsNotDir(err error) bool {
 	if se, ok := err.(*os.SyscallError); ok {
-		return se.Err == syscall.ENOTDIR
+		return se.Err == syscall.ENOTDIR || se.Err == syscall.EINVAL
 	}
 	if se, ok := err.(*os.PathError); ok {
 		return os.IsNotExist(se)
@@ -512,7 +422,7 @@ func (k *KeyedLimit) Acquire(key string, force bool) int64 {
 	if k.locked[key] {
 		k.lock.Unlock()
 		return -1
-	} else if v := k.inUse[key]; !force && (v >= k.limitPerKey || k.totalUse > k.totalLimit) {
+	} else if v := k.inUse[key]; !force && ((k.limitPerKey > 0 && v >= k.limitPerKey) || (k.totalLimit > 0 && k.totalUse > k.totalLimit)) {
 		k.lock.Unlock()
 		return v
 	} else {
@@ -565,14 +475,18 @@ func NewKeyedLimit(limitPerKey int64, totalLimit int64) *KeyedLimit {
 	return &KeyedLimit{limitPerKey: limitPerKey, totalLimit: totalLimit, locked: make(map[string]bool), inUse: make(map[string]int64)}
 }
 
+var configLocations = []string{"/etc/hummingbird/hummingbird.conf", "/etc/swift/swift.conf"}
+
 // GetHashPrefixAndSuffix retrieves the hash path prefix and suffix from
 // the correct configs based on the environments setup. The suffix cannot
 // be nil
-func GetHashPrefixAndSuffix() (prefix string, suffix string, err error) {
-	config_locations := []string{"/etc/hummingbird/hummingbird.conf", "/etc/swift/swift.conf"}
+type getHashPrefixAndSuffixFunc func() (pfx string, sfx string, err error)
 
-	for _, loc := range config_locations {
-		if conf, e := LoadIniFile(loc); e == nil {
+var GetHashPrefixAndSuffix getHashPrefixAndSuffixFunc = normalGetHashPrefixAndSuffix
+
+func normalGetHashPrefixAndSuffix() (prefix string, suffix string, err error) {
+	for _, loc := range configLocations {
+		if conf, e := LoadConfig(loc); e == nil {
 			var ok bool
 			prefix, _ = conf.Get("swift-hash", "swift_hash_path_prefix")
 			if suffix, ok = conf.Get("swift-hash", "swift_hash_path_suffix"); !ok {

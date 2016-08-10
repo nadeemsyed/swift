@@ -18,11 +18,11 @@ package objectserver
 import (
 	"crypto/md5"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/syslog"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/textproto"
@@ -36,27 +36,39 @@ import (
 	"github.com/openstack/swift/go/middleware"
 )
 
-var DefaultObjEngine = "swift"
-
 type ObjectServer struct {
-	driveRoot       string
-	hashPathPrefix  string
-	hashPathSuffix  string
-	checkEtags      bool
-	checkMounts     bool
-	allowedHeaders  map[string]bool
-	logger          *syslog.Writer
-	logLevel        string
-	diskInUse       *hummingbird.KeyedLimit
-	expiringDivisor int64
-	updateClient    *http.Client
-	objEngine       ObjectEngine
+	driveRoot        string
+	hashPathPrefix   string
+	hashPathSuffix   string
+	checkEtags       bool
+	checkMounts      bool
+	allowedHeaders   map[string]bool
+	logger           *syslog.Writer
+	logLevel         string
+	diskInUse        *hummingbird.KeyedLimit
+	accountDiskInUse *hummingbird.KeyedLimit
+	expiringDivisor  int64
+	updateClient     *http.Client
+	objEngines       map[int]ObjectEngine
+	updateTimeout    time.Duration
+}
+
+func (server *ObjectServer) newObject(req *http.Request, vars map[string]string, needData bool) (Object, error) {
+	policy, err := strconv.Atoi(req.Header.Get("X-Backend-Storage-Policy-Index"))
+	if err != nil {
+		policy = 0
+	}
+	engine, ok := server.objEngines[policy]
+	if !ok {
+		return nil, fmt.Errorf("Engine for policy index %d not found.", policy)
+	}
+	return engine.New(vars, needData)
 }
 
 func (server *ObjectServer) ObjGetHandler(writer http.ResponseWriter, request *http.Request) {
 	vars := hummingbird.GetVars(request)
 	headers := writer.Header()
-	obj, err := server.objEngine.New(vars, request.Method == "GET")
+	obj, err := server.newObject(request, vars, request.Method == "GET")
 	if err != nil {
 		hummingbird.GetLogger(request).LogError("Unable to open object: %v", err)
 		hummingbird.StandardResponse(writer, http.StatusInternalServerError)
@@ -206,7 +218,7 @@ func (server *ObjectServer) ObjPutHandler(writer http.ResponseWriter, request *h
 		}
 	}
 
-	obj, err := server.objEngine.New(vars, false)
+	obj, err := server.newObject(request, vars, false)
 	if err != nil {
 		hummingbird.GetLogger(request).LogError("Error getting obj: %s", err.Error())
 		hummingbird.StandardResponse(writer, http.StatusInternalServerError)
@@ -295,7 +307,7 @@ func (server *ObjectServer) ObjDeleteHandler(writer http.ResponseWriter, request
 	}
 	responseStatus := http.StatusNotFound
 
-	obj, err := server.objEngine.New(vars, false)
+	obj, err := server.newObject(request, vars, false)
 	if err != nil {
 		hummingbird.GetLogger(request).LogError("Error getting obj: %s", err.Error())
 		hummingbird.StandardResponse(writer, http.StatusInternalServerError)
@@ -434,6 +446,15 @@ func (server *ObjectServer) AcquireDevice(next http.Handler) http.Handler {
 				return
 			}
 			defer server.diskInUse.Release(device)
+
+			if account, ok := vars["account"]; ok && account != "" {
+				limitKey := fmt.Sprintf("%s/%s", device, account)
+				if concRequests := server.accountDiskInUse.Acquire(limitKey, false); concRequests != 0 {
+					hummingbird.StandardResponse(writer, 498)
+					return
+				}
+				defer server.accountDiskInUse.Release(limitKey)
+			}
 		}
 		next.ServeHTTP(writer, request)
 	}
@@ -455,7 +476,7 @@ func (server *ObjectServer) updateDeviceLocks(seconds int64) {
 	}
 }
 
-func (server *ObjectServer) GetHandler() http.Handler {
+func (server *ObjectServer) GetHandler(config hummingbird.Config) http.Handler {
 	commonHandlers := alice.New(middleware.ClearHandler, server.LogRequest, middleware.ValidateRequest, server.AcquireDevice)
 	router := hummingbird.NewRouter()
 	router.Get("/healthcheck", commonHandlers.ThenFunc(server.HealthcheckHandler))
@@ -471,13 +492,15 @@ func (server *ObjectServer) GetHandler() http.Handler {
 	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Invalid path: %s", r.URL.Path), http.StatusBadRequest)
 	})
-	server.objEngine.RegisterHandlers(func(method, path string, handler http.HandlerFunc) {
-		router.Handle(method, path, commonHandlers.ThenFunc(handler))
-	})
+	for policy, objEngine := range server.objEngines {
+		objEngine.RegisterHandlers(func(method, path string, handler http.HandlerFunc) {
+			router.HandlePolicy(method, path, policy, commonHandlers.ThenFunc(handler))
+		})
+	}
 	return alice.New(middleware.GrepObject).Then(router)
 }
 
-func GetServer(conf string, flags *flag.FlagSet) (bindIP string, bindPort int, serv hummingbird.Server, logger hummingbird.SysLogLike, err error) {
+func GetServer(serverconf hummingbird.Config, flags *flag.FlagSet) (bindIP string, bindPort int, serv hummingbird.Server, logger hummingbird.SysLogLike, err error) {
 	server := &ObjectServer{driveRoot: "/srv/node", hashPathPrefix: "", hashPathSuffix: "",
 		allowedHeaders: map[string]bool{"Content-Disposition": true,
 			"Content-Encoding":      true,
@@ -490,23 +513,24 @@ func GetServer(conf string, flags *flag.FlagSet) (bindIP string, bindPort int, s
 	if err != nil {
 		return "", 0, nil, nil, err
 	}
-
-	serverconf, err := hummingbird.LoadIniFile(conf)
-	if err != nil {
-		return "", 0, nil, nil, errors.New(fmt.Sprintf("Unable to load %s", conf))
+	server.objEngines = make(map[int]ObjectEngine)
+	for _, policy := range hummingbird.LoadPolicies() {
+		if newEngine, err := FindEngine(policy.Type); err != nil {
+			return "", 0, nil, nil, fmt.Errorf("Unable to find object engine type %s: %v", policy.Type, err)
+		} else {
+			server.objEngines[policy.Index], err = newEngine(serverconf, policy, flags)
+			if err != nil {
+				return "", 0, nil, nil, fmt.Errorf("Error instantiating object engine type %s: %v", policy.Type, err)
+			}
+		}
 	}
 
-	objEngineName := serverconf.GetDefault("app:object-server", "object_engine", DefaultObjEngine)
-	if newEngineFactory, err := FindEngine(objEngineName); err != nil {
-		return "", 0, nil, nil, errors.New("Unable to find object engine")
-	} else if server.objEngine, err = newEngineFactory(serverconf, flags); err != nil {
-		return "", 0, nil, nil, err
-	}
 	server.driveRoot = serverconf.GetDefault("app:object-server", "devices", "/srv/node")
 	server.checkMounts = serverconf.GetBool("app:object-server", "mount_check", true)
 	server.checkEtags = serverconf.GetBool("app:object-server", "check_etags", false)
 	server.logLevel = serverconf.GetDefault("app:object-server", "log_level", "INFO")
-	server.diskInUse = hummingbird.NewKeyedLimit(serverconf.GetLimit("app:object-server", "disk_limit", 25, 10000))
+	server.diskInUse = hummingbird.NewKeyedLimit(serverconf.GetLimit("app:object-server", "disk_limit", 25, 0))
+	server.accountDiskInUse = hummingbird.NewKeyedLimit(serverconf.GetLimit("app:object-server", "account_rate_limit", 20, 0))
 	server.expiringDivisor = serverconf.GetInt("app:object-server", "expiring_objects_container_divisor", 86400)
 	bindIP = serverconf.GetDefault("app:object-server", "bind_ip", "0.0.0.0")
 	bindPort = int(serverconf.GetInt("app:object-server", "bind_port", 6000))
@@ -517,7 +541,13 @@ func GetServer(conf string, flags *flag.FlagSet) (bindIP string, bindPort int, s
 		}
 	}
 	server.logger = hummingbird.SetupLogger(serverconf.GetDefault("app:object-server", "log_facility", "LOG_LOCAL1"), "object-server", "")
-	server.updateClient = &http.Client{Timeout: time.Second * 15}
+	server.updateTimeout = time.Duration(serverconf.GetFloat("app:object-server", "container_update_timeout", 0.25) * float64(time.Second))
+	connTimeout := time.Duration(serverconf.GetFloat("app:object-server", "conn_timeout", 1.0) * float64(time.Second))
+	nodeTimeout := time.Duration(serverconf.GetFloat("app:object-server", "node_timeout", 10.0) * float64(time.Second))
+	server.updateClient = &http.Client{
+		Timeout:   nodeTimeout,
+		Transport: &http.Transport{Dial: (&net.Dialer{Timeout: connTimeout}).Dial},
+	}
 
 	deviceLockUpdateSeconds := serverconf.GetInt("app:object-server", "device_lock_update_seconds", 0)
 	if deviceLockUpdateSeconds > 0 {

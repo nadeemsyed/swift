@@ -37,6 +37,7 @@ var AuditForeverInterval = 30 * time.Second
 type AuditorDaemon struct {
 	checkMounts       bool
 	driveRoot         string
+	policies          hummingbird.PolicyList
 	logger            hummingbird.SysLogLike
 	bytesPerSecond    int64
 	logTime           int64
@@ -197,22 +198,27 @@ func (a *Auditor) auditDevice(devPath string) {
 		return
 	}
 
-	objPath := filepath.Join(devPath, "objects")
-	partitions, err := hummingbird.ReadDirNames(objPath)
-	if err != nil {
-		a.errors++
-		a.totalErrors++
-		a.LogError("Error reading objects dir %s", objPath)
-		return
-	}
-	for _, partition := range partitions {
-		_, intErr := strconv.ParseInt(partition, 10, 64)
-		partitionDir := filepath.Join(objPath, partition)
-		if finfo, err := os.Stat(partitionDir); err != nil || intErr != nil || !finfo.Mode().IsDir() {
-			a.LogError("Skipping invalid file in objects directory: %s", partitionDir)
+	for _, policy := range a.policies {
+		if policy.Type != "replication" {
 			continue
 		}
-		a.auditPartition(partitionDir)
+		objPath := filepath.Join(devPath, PolicyDir(policy.Index))
+		partitions, err := hummingbird.ReadDirNames(objPath)
+		if err != nil {
+			a.errors++
+			a.totalErrors++
+			a.LogError("Error reading objects dir: %s", objPath)
+			continue
+		}
+		for _, partition := range partitions {
+			_, intErr := strconv.ParseInt(partition, 10, 64)
+			partitionDir := filepath.Join(objPath, partition)
+			if finfo, err := os.Stat(partitionDir); err != nil || intErr != nil || !finfo.Mode().IsDir() {
+				a.LogError("Skipping invalid file in objects directory: %s", partitionDir)
+				continue
+			}
+			a.auditPartition(partitionDir)
+		}
 	}
 }
 
@@ -326,12 +332,12 @@ func (d *AuditorDaemon) RunForever() {
 }
 
 // NewAuditor returns a new AuditorDaemon with the given conf.
-func NewAuditor(conf string, flags *flag.FlagSet) (hummingbird.Daemon, error) {
-	d := &AuditorDaemon{}
-	serverconf, err := hummingbird.LoadIniFile(conf)
-	if err != nil || !serverconf.HasSection("object-auditor") {
-		return nil, fmt.Errorf("Unable to find auditor config: %s", conf)
+func NewAuditor(serverconf hummingbird.Config, flags *flag.FlagSet) (hummingbird.Daemon, error) {
+	if !serverconf.HasSection("object-auditor") {
+		return nil, fmt.Errorf("Unable to find object-auditor config section")
 	}
+	d := &AuditorDaemon{}
+	d.policies = hummingbird.LoadPolicies()
 	d.driveRoot = serverconf.GetDefault("object-auditor", "devices", "/srv/node")
 	d.checkMounts = serverconf.GetBool("object-auditor", "mount_check", true)
 	d.logger = hummingbird.SetupLogger(serverconf.GetDefault("object-auditor", "log_facility", "LOG_LOCAL0"), "object-auditor", "")

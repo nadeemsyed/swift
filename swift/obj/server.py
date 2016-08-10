@@ -44,14 +44,15 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
 from swift.obj import ssync_receiver
 from swift.common.http import is_success
 from swift.common.base_storage_server import BaseStorageServer
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
     is_user_meta, is_sys_or_user_meta
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
-    HTTPInsufficientStorage, HTTPForbidden, HTTPException, HeaderKeyDict, \
-    HTTPConflict, HTTPServerError
+    HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
+    HTTPServerError
 from swift.obj.diskfile import DATAFILE_SYSTEM_META, DiskFileRouter
 
 
@@ -250,7 +251,8 @@ class ObjectController(BaseStorageServer):
                     {'ip': ip, 'port': port, 'dev': contdevice})
         data = {'op': op, 'account': account, 'container': container,
                 'obj': obj, 'headers': headers_out}
-        timestamp = headers_out['x-timestamp']
+        timestamp = headers_out.get('x-meta-timestamp',
+                                    headers_out.get('x-timestamp'))
         self._diskfile_router[policy].pickle_async_update(
             objdevice, account, container, obj, data, timestamp, policy)
 
@@ -279,11 +281,12 @@ class ObjectController(BaseStorageServer):
         if len(conthosts) != len(contdevices):
             # This shouldn't happen unless there's a bug in the proxy,
             # but if there is, we want to know about it.
-            self.logger.error(_('ERROR Container update failed: different '
-                                'numbers of hosts and devices in request: '
-                                '"%s" vs "%s"') %
-                               (headers_in.get('X-Container-Host', ''),
-                                headers_in.get('X-Container-Device', '')))
+            self.logger.error(_(
+                'ERROR Container update failed: different '
+                'numbers of hosts and devices in request: '
+                '"%(hosts)s" vs "%(devices)s"') % {
+                    'hosts': headers_in.get('X-Container-Host', ''),
+                    'devices': headers_in.get('X-Container-Device', '')})
             return
 
         if contpartition:
@@ -541,15 +544,6 @@ class ObjectController(BaseStorageServer):
         except (DiskFileXattrNotSupported, DiskFileNoSpace):
             return HTTPInsufficientStorage(drive=device, request=request)
 
-        update_etag = orig_metadata['ETag']
-        if 'X-Object-Sysmeta-Ec-Etag' in orig_metadata:
-            # For EC policy, send X-Object-Sysmeta-Ec-Etag which is same as the
-            # X-Backend-Container-Update-Override-Etag value sent with the
-            # original PUT. We have to send Etag (and size etc) with a POST
-            # container update because the original PUT container update may
-            # have failed or be in async_pending.
-            update_etag = orig_metadata['X-Object-Sysmeta-Ec-Etag']
-
         if (content_type_headers['Content-Type-Timestamp']
                 != disk_file.data_timestamp):
             # Current content-type is not from the datafile, but the datafile
@@ -565,16 +559,34 @@ class ObjectController(BaseStorageServer):
                 content_type_headers['Content-Type'] += (';swift_bytes=%s'
                                                          % swift_bytes)
 
+        update_headers = HeaderKeyDict({
+            'x-size': orig_metadata['Content-Length'],
+            'x-content-type': content_type_headers['Content-Type'],
+            'x-timestamp': disk_file.data_timestamp.internal,
+            'x-content-type-timestamp':
+            content_type_headers['Content-Type-Timestamp'],
+            'x-meta-timestamp': metadata['X-Timestamp'],
+            'x-etag': orig_metadata['ETag']})
+
+        # Special cases for backwards compatibility.
+        # For EC policy, send X-Object-Sysmeta-Ec-Etag which is same as the
+        # X-Backend-Container-Update-Override-Etag value sent with the original
+        # PUT. Similarly send X-Object-Sysmeta-Ec-Content-Length which is the
+        # same as the X-Backend-Container-Update-Override-Size value. We have
+        # to send Etag and size with a POST container update because the
+        # original PUT container update may have failed or be in async_pending.
+        if 'X-Object-Sysmeta-Ec-Etag' in orig_metadata:
+            update_headers['X-Etag'] = orig_metadata[
+                'X-Object-Sysmeta-Ec-Etag']
+        if 'X-Object-Sysmeta-Ec-Content-Length' in orig_metadata:
+            update_headers['X-Size'] = orig_metadata[
+                'X-Object-Sysmeta-Ec-Content-Length']
+
+        self._check_container_override(update_headers, orig_metadata)
+
+        # object POST updates are PUT to the container server
         self.container_update(
-            'PUT', account, container, obj, request,
-            HeaderKeyDict({
-                'x-size': orig_metadata['Content-Length'],
-                'x-content-type': content_type_headers['Content-Type'],
-                'x-timestamp': disk_file.data_timestamp.internal,
-                'x-content-type-timestamp':
-                content_type_headers['Content-Type-Timestamp'],
-                'x-meta-timestamp': metadata['X-Timestamp'],
-                'x-etag': update_etag}),
+            'PUT', account, container, obj, request, update_headers,
             device, policy)
         return HTTPAccepted(request=request)
 
@@ -1105,7 +1117,7 @@ def global_conf_callback(preloaded_app_conf, global_conf):
     """
     Callback for swift.common.wsgi.run_wsgi during the global_conf
     creation so that we can add our replication_semaphore, used to
-    limit the number of concurrent REPLICATION_REQUESTS across all
+    limit the number of concurrent SSYNC_REQUESTS across all
     workers.
 
     :param preloaded_app_conf: The preloaded conf for the WSGI app.

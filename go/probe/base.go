@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/openstack/swift/go/hummingbird"
 	"github.com/openstack/swift/go/objectserver"
@@ -111,18 +112,18 @@ func (e *Environment) Close() {
 }
 
 // FileLocations returns a list of file paths for the object's hash directory on all three underlying object servers.
-func (e *Environment) FileLocations(account, container, obj string) (paths []string) {
+func (e *Environment) FileLocations(account, container, obj string, policy int) (paths []string) {
 	partition := e.ring.GetPartition(account, container, obj)
 	vars := map[string]string{"account": account, "container": container, "obj": obj, "partition": strconv.Itoa(int(partition)), "device": "sda"}
 	for i := 0; i < 4; i++ {
-		path := objectserver.ObjHashDir(vars, e.driveRoots[i], e.hashPrefix, e.hashSuffix)
+		path := objectserver.ObjHashDir(vars, e.driveRoots[i], e.hashPrefix, e.hashSuffix, policy)
 		paths = append(paths, path)
 	}
 	return
 }
 
 // PutObject uploads an object "/a/c/o" to the indicated server with X-Timestamp set to timestamp and body set to data.
-func (e *Environment) PutObject(server int, timestamp string, data string) bool {
+func (e *Environment) PutObject(server int, timestamp string, data string, policy int) bool {
 	body := bytes.NewBuffer([]byte(data))
 	req, err := http.NewRequest("PUT", fmt.Sprintf("http://%s:%d/sda/0/a/c/o", e.hosts[server], e.ports[server]), body)
 	if err != nil {
@@ -131,16 +132,30 @@ func (e *Environment) PutObject(server int, timestamp string, data string) bool 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Length", strconv.Itoa(len(data)))
 	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(policy))
 	resp, err := http.DefaultClient.Do(req)
 	return err == nil && resp.StatusCode == 201
 }
 
+// DeleteObject deletes the object.
+func (e *Environment) DeleteObject(server int, timestamp string, policy int) bool {
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:%d/sda/0/a/c/o", e.hosts[server], e.ports[server]), nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Timestamp", timestamp)
+	req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(policy))
+	resp, err := http.DefaultClient.Do(req)
+	return err == nil && resp.StatusCode == 204
+}
+
 // ObjExists returns a boolean indicating that it can fetch the named object and that its X-Timestamp matches the timestamp argument.
-func (e *Environment) ObjExists(server int, timestamp string) bool {
+func (e *Environment) ObjExists(server int, timestamp string, policy int) bool {
 	req, err := http.NewRequest("HEAD", fmt.Sprintf("http://%s:%d/sda/0/a/c/o", e.hosts[server], e.ports[server]), nil)
 	if err != nil {
 		return false
 	}
+	req.Header.Set("X-Backend-Storage-Policy-Index", strconv.Itoa(policy))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		return false
@@ -150,6 +165,30 @@ func (e *Environment) ObjExists(server int, timestamp string) bool {
 
 // NewEnvironment creates a new environment.  Arguments should be a series of key, value pairs that are added to the object server configuration file.
 func NewEnvironment(settings ...string) *Environment {
+	oldLoadPolicies := hummingbird.LoadPolicies
+	hummingbird.LoadPolicies = func() hummingbird.PolicyList {
+		return hummingbird.PolicyList(map[int]*hummingbird.Policy{
+			0: &hummingbird.Policy{
+				Index:      0,
+				Type:       "replication",
+				Name:       "Policy-0",
+				Aliases:    nil,
+				Default:    false,
+				Deprecated: false,
+			},
+			1: &hummingbird.Policy{
+				Index:      1,
+				Type:       "replication",
+				Name:       "Policy-1",
+				Aliases:    nil,
+				Default:    false,
+				Deprecated: false,
+			},
+		})
+	}
+	defer func() {
+		hummingbird.LoadPolicies = oldLoadPolicies
+	}()
 	env := &Environment{ring: &FakeRing{devices: nil}}
 	env.hashPrefix, env.hashSuffix, _ = hummingbird.GetHashPrefixAndSuffix()
 	for i := 0; i < 4; i++ {
@@ -160,25 +199,21 @@ func NewEnvironment(settings ...string) *Environment {
 		host, ports, _ := net.SplitHostPort(u.Host)
 		port, _ := strconv.Atoi(ports)
 
-		conf, _ := ioutil.TempFile("", "")
-		conf.WriteString("[DEFAULT]\nmount_check=false\n")
-		fmt.Fprintf(conf, "devices=%s\n", driveRoot)
-		fmt.Fprintf(conf, "bind_port=%d\n", port)
-		fmt.Fprintf(conf, "bind_ip=%s\n", host)
+		configString := "[DEFAULT]\nmount_check=false\n"
+		configString += fmt.Sprintf("devices=%s\n", driveRoot)
+		configString += fmt.Sprintf("bind_port=%d\n", port)
+		configString += fmt.Sprintf("bind_ip=%s\n", host)
 		for i := 0; i < len(settings); i += 2 {
-			fmt.Fprintf(conf, "%s=%s\n", settings[i], settings[i+1])
+			configString += fmt.Sprintf("%s=%s\n", settings[i], settings[i+1])
 		}
-		conf.WriteString("[app:object-server]\n")
-		conf.WriteString("[object-replicator]\n")
-		conf.WriteString("[object-auditor]\n")
-		defer conf.Close()
-		defer os.RemoveAll(conf.Name())
-
-		_, _, server, _, _ := objectserver.GetServer(conf.Name(), &flag.FlagSet{})
-		ts.Config.Handler = server.GetHandler()
-		replicator, _ := objectserver.NewReplicator(conf.Name(), &flag.FlagSet{})
-		auditor, _ := objectserver.NewAuditor(conf.Name(), &flag.FlagSet{})
-		replicator.(*objectserver.Replicator).Ring = env.ring
+		configString += "[app:object-server]\n[object-replicator]\n[object-auditor]\n"
+		conf, _ := hummingbird.StringConfig(configString)
+		_, _, server, _, _ := objectserver.GetServer(conf, &flag.FlagSet{})
+		ts.Config.Handler = server.GetHandler(conf)
+		replicator, _ := objectserver.NewReplicator(conf, &flag.FlagSet{})
+		auditor, _ := objectserver.NewAuditor(conf, &flag.FlagSet{})
+		replicator.(*objectserver.Replicator).Rings[0] = env.ring
+		replicator.(*objectserver.Replicator).Rings[1] = env.ring
 		env.ring.(*FakeRing).devices = append(env.ring.(*FakeRing).devices, &hummingbird.Device{
 			Id: i, Device: "sda", Ip: host, Port: port, Region: 0, ReplicationIp: host, ReplicationPort: port, Weight: 1, Zone: i,
 		})
@@ -188,6 +223,7 @@ func NewEnvironment(settings ...string) *Environment {
 		env.ports = append(env.ports, port)
 		env.hosts = append(env.hosts, host)
 		env.replicators = append(env.replicators, replicator.(*objectserver.Replicator))
+		env.replicators[len(env.replicators)-1].LoopSleepTime = 0 * time.Second
 		env.auditors = append(env.auditors, auditor.(*objectserver.AuditorDaemon))
 	}
 	return env

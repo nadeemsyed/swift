@@ -17,11 +17,8 @@ package hummingbird
 
 import (
 	"bytes"
-	"fmt"
 	"io/ioutil"
 	"os"
-	"os/user"
-	"strconv"
 	"testing"
 	"time"
 
@@ -218,24 +215,8 @@ func TestUrlencode(t *testing.T) {
 	assert.True(t, Urlencode("鐋댋") == "%E9%90%8B%EB%8C%8B")
 }
 
-func TestIniFile(t *testing.T) {
-	tempFile, err := ioutil.TempFile("", "INI")
-	assert.Nil(t, err)
-	defer os.RemoveAll(tempFile.Name())
-	tempFile.WriteString("[stuff]\ntruevalue=true\nfalsevalue=false\nintvalue=3\nset log_facility = LOG_LOCAL1\n")
-	iniFile, err := LoadIniFile(tempFile.Name())
-	assert.Equal(t, true, iniFile.GetBool("stuff", "truevalue", false))
-	assert.Equal(t, false, iniFile.GetBool("stuff", "falsevalue", true))
-	assert.Equal(t, true, iniFile.GetBool("stuff", "defaultvalue", true))
-	assert.Equal(t, int64(3), iniFile.GetInt("stuff", "intvalue", 2))
-	assert.Equal(t, int64(2), iniFile.GetInt("stuff", "missingvalue", 2))
-	assert.Equal(t, "false", iniFile.GetDefault("stuff", "falsevalue", "true"))
-	assert.Equal(t, "true", iniFile.GetDefault("stuff", "missingvalue", "true"))
-	assert.Equal(t, "LOG_LOCAL1", iniFile.GetDefault("stuff", "log_facility", "LOG_LOCAL0"))
-}
-
 func TestIsMount(t *testing.T) {
-	isMount, err := IsMount("/proc")
+	isMount, err := IsMount("/dev")
 	assert.Nil(t, err)
 	assert.True(t, isMount)
 	isMount, err = IsMount(".")
@@ -292,7 +273,24 @@ func TestReadDirNames(t *testing.T) {
 	assert.Equal(t, fileNames, []string{"X", "Y", "Z"})
 }
 
+func fakeHashPrefixAndSuffix() (filename string, err error) {
+	var config_source []byte = []byte(
+		"[swift-hash]\n" +
+			"swift_hash_path_suffix = 983abc1de3ff4258\n")
+	tempFile, err := ioutil.TempFile("", "swift.conf-")
+	if err != nil {
+		return "", err
+	}
+	ioutil.WriteFile(tempFile.Name(), config_source, 0600)
+	configLocations = []string{tempFile.Name()}
+	return tempFile.Name(), nil
+}
+
 func TestGetHashPrefixAndSuffix(t *testing.T) {
+	swift_conf_name, err := fakeHashPrefixAndSuffix()
+	assert.Nil(t, err)
+	defer os.Remove(swift_conf_name)
+
 	_, suffix, err := GetHashPrefixAndSuffix()
 	assert.Nil(t, err, "Error getting hash path prefix or suffix")
 
@@ -301,31 +299,26 @@ func TestGetHashPrefixAndSuffix(t *testing.T) {
 	}
 }
 
-func TestUidFromConf(t *testing.T) {
-	usr, err := user.Current()
-	assert.Nil(t, err)
-	tempFile, err := ioutil.TempFile("", "INI")
-	assert.Nil(t, err)
-	defer os.RemoveAll(tempFile.Name())
-	defer tempFile.Close()
-	fmt.Fprintf(tempFile, "[DEFAULT]\nuser=%s\n", usr.Username)
-
-	currentUid, err := strconv.ParseUint(usr.Uid, 10, 32)
-	assert.Nil(t, err)
-	currentGid, err := strconv.ParseUint(usr.Gid, 10, 32)
-	assert.Nil(t, err)
-	uid, gid, err := UidFromConf(tempFile.Name())
-	assert.Nil(t, err)
-	assert.Equal(t, uint32(currentUid), uint32(uid))
-	assert.Equal(t, uint32(currentGid), uint32(gid))
-}
-
-func TestUidFromConfFailure(t *testing.T) {
-	tempFile, err := ioutil.TempFile("", "INI")
-	assert.Nil(t, err)
-	defer os.RemoveAll(tempFile.Name())
-	defer tempFile.Close()
-	fmt.Fprintf(tempFile, "[DEFAULT]\nuser=SomeUserWhoShouldntExist\n")
-	_, _, err = UidFromConf(tempFile.Name())
-	assert.NotNil(t, err)
+func TestLockPath(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "")
+	defer os.RemoveAll(tempDir)
+	require.Nil(t, err)
+	c := make(chan bool)
+	ended := make(chan struct{})
+	defer close(ended)
+	go func() {
+		f, err := LockPath(tempDir, time.Millisecond)
+		c <- true
+		require.Nil(t, err)
+		require.NotNil(t, f)
+		defer f.Close()
+		select {
+		case <-time.After(time.Second):
+		case <-ended:
+		}
+	}()
+	<-c
+	f, err := LockPath(tempDir, time.Millisecond)
+	require.Nil(t, f)
+	require.NotNil(t, err)
 }

@@ -1,3 +1,244 @@
+swift (2.8.0)
+
+    * Allow concurrent bulk deletes for server-side deletes of static
+      large objects. Previously this would be single-threaded and each
+      DELETE executed serially. The new `delete_concurrency` value
+      (default value is 2) in the `[filter:slo]` and `[filter:bulk]`
+      sections of the proxy server config controls the concurrency
+      used to perform the DELETE requests for referenced segments. The
+      default value is recommended, but setting the value to 1
+      restores previous behavior.
+
+    * Refactor server-side copy as middleware
+
+      The COPY verb is now implemented in the `copy` middleware instead
+      of in the proxy server code. If not explicitly added, the server
+      side copy middleware is auto-inserted to the left of `dlo`, `slo`
+      and `versioned_writes` middlewares in the proxy server pipeline.
+      As a result, dlo and slo `copy_hooks` are no longer required. SLO
+      manifests are now validated when copied so when copying a
+      manifest to another account the referenced segments must be
+      readable in that account for the manifest copy to succeed
+      (previously this validation was not made, meaning the manifest
+      was copied but could be unusable if the segments were not
+      readable).
+
+      With this change, there should be no change in functionality or
+      existing behavior.
+
+    * `fallocate_reserve` can now be a percentage (a value ending in "%"),
+      and the default has been adjusted to "1%".
+
+    * Now properly require account/container metadata be valid UTF-8
+
+    * TempURL responses now include an `Expires` header with the
+      expiration time embedded in the URL.
+
+    * Non-Python dependencies are now listed in other-requirements.txt.
+
+    * `swift-ring-builder` now supports a `--yes` option to assume a
+      yes response to all questions. This is useful for scripts.
+
+    * Write requests to a replicated storage policy with an even number
+      of replicas now have a quorum size of half the replica count
+      instead of half-plus-one.
+
+    * Container sync now logs per-container stat information so operators
+      can track progress. This is logged at INFO level.
+
+    * `swift-dispersion-*` now allows region to be specified when there
+      are multiple Swift regions served by the same Keystone instance
+
+    * Fix infinite recursion during logging when syslog is down.
+
+    * Fixed a bug where a backend failure during a read could result in
+      a missing byte in the response body.
+
+    * Stop `staticweb` revealing container existence to unauth'd requests.
+
+    * Reclaim isolated .meta files if they are older than the `reclaim_age`.
+
+    * Make `rsync` ignore its own temporary files instead of spreading
+      them around the cluster, wasting space.
+
+    * The object auditor now ignores files in the devices directory when
+      auditing objects.
+
+    * The deprecated `threads_per_disk` setting has been removed. Deployers
+      are encouraged to use `servers_per_port` instead.
+
+    * Fixed an issue where a single-replica configuration for account or
+      container DBs could result in the DB being inadvertently deleted if
+      it was placed on a handoff node.
+
+    * `disable_fallocate` now also correctly disables `fallocate_reserve`.
+
+    * Fixed a bug where the account-reaper did not delete all containers
+      in a reaped account.
+
+    * Correctly handle delimiter queries where results start with the
+      delimiter and no prefix is given.
+
+    * Changed the recommended ports for Swift services from ports
+      6000-6002 to unused ports 6200-6202 so they do not conflict with
+      X-Windows or other services. Since these config values must be
+      explicitly set in the config file, this doesn't impact existing
+      deployments.
+
+    * Fixed an instance where REPLICATE requests would not use
+      `replication_ip`.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.7.0, OpenStack Mitaka)
+
+    * Bump PyECLib requirement to >= 1.2.0
+
+    * Update container on fast-POST
+
+      "Fast-POST" is the mode where `object_post_as_copy` is set to
+      `False` in the proxy server config. This mode now allows for
+      fast, efficient updates of metadata without needing to fully
+      recopy the contents of the object. While the default still is
+      `object_post_as_copy` as True, the plan is to change the default
+      to False and then deprecate post-as-copy functionality in later
+      releases. Fast-POST now supports container-sync functionality.
+
+    * Add concurrent reads option to proxy.
+
+      This change adds 2 new parameters to enable and control concurrent
+      GETs in Swift, these are `concurrent_gets` and `concurrency_timeout`.
+
+      `concurrent_gets` allows you to turn on or off concurrent
+      GETs; when on, it will set the GET/HEAD concurrency to the
+      replica count. And in the case of EC HEADs it will set it to
+      ndata. The proxy will then serve only the first valid source to
+      respond. This applies to all account, container, and replicated
+      object GETs and HEADs. For EC only HEAD requests are affected.
+      The default for `concurrent_gets` is off.
+
+      `concurrency_timeout` is related to `concurrent_gets` and is
+      the amount of time to wait before firing the next thread. A
+      value of 0 will fire at the same time (fully concurrent), but
+      setting another value will stagger the firing allowing you the
+      ability to give a node a short chance to respond before firing
+      the next. This value is a float and should be somewhere between
+      0 and `node_timeout`. The default is `conn_timeout`, meaning by
+      default it will stagger the firing.
+
+    * Added an operational procedures guide to the docs. It can be
+      found at http://swift.openstack.org/ops_runbook/index.html and
+      includes information on detecting and handling day-to-day
+      operational issues in a Swift cluster.
+
+    * Make `handoffs_first` a more useful mode for the object replicator.
+
+      The `handoffs_first` replication mode is used during periods of
+      problematic cluster behavior (e.g. full disks) when replication
+      needs to quickly drain partitions from a handoff node and move
+      them to a primary node.
+
+      Previously, `handoffs_first` would sort that handoff work before
+      "normal" replication jobs, but the normal replication work could
+      take quite some time and result in handoffs not being drained
+      quickly enough.
+
+      In order to focus on getting handoff partitions off the node
+      `handoffs_first` mode will now abort the current replication
+      sweep before attempting any primary suffix syncing if any of the
+      handoff partitions were not removed for any reason - and start
+      over with replication of handoffs jobs as the highest priority.
+
+      Note that `handoffs_first` being enabled will emit a warning on
+      start up, even if no handoff jobs fail, because of the negative
+      impact it can have during normal operations by dog-piling on a
+      node that was temporarily unavailable.
+
+    * By default, inbound `X-Timestamp` headers are now disallowed
+      (except when in an authorized container-sync request). This
+      header is useful for allowing data migration from other storage
+      systems to Swift and keeping the original timestamp of the data.
+      If you have this migration use case (or any other requirement on
+      allowing the clients to set an object's timestamp), set the
+      `shunt_inbound_x_timestamp` config variable to False in the
+      gatekeeper middleware config section of the proxy server config.
+
+    * Requesting a SLO manifest file with the query parameters
+      "?multipart-manifest=get&format=raw" will return the contents of
+      the manifest in the format as was originally sent by the client.
+      The "format=raw" is new.
+
+    * Static web page listings can now be rendered with a custom
+      label. By default listings are rendered with a label of:
+      "Listing of /v1/<account>/<container>/<path>". This change adds
+      a new custom metadata key/value pair
+      `X-Container-Meta-Web-Listings-Label: My Label` that when set,
+      will cause the following: "Listing of My Label/<path>" to be
+      rendered instead.
+
+    * Previously, static large objects (SLOs) had a minimum segment
+      size (default to 1MiB). This limit has been removed, but small
+      segments will be ratelimited. The config parameter
+      `rate_limit_under_size` controls the definition of "small"
+      segments (1MiB by default), and `rate_limit_segments_per_sec`
+      controls how many segments per second can be served (default is 1).
+      With the default values, the effective behavior is identical to the
+      previous behavior when serving SLOs.
+
+    * Container sync has been improved to perform a HEAD on the remote
+      side of the sync for each object being synced. If the object
+      exists on the remote side, container-sync will no longer
+      transfer the object, thus significantly lowering the network
+      requirements to use the feature.
+
+    * The object auditor will now clean up any old, stale rsync temp
+      files that it finds. These rsync temp files are left if the
+      rsync process fails without completing a full transfer of an
+      object. Since these files can be large, the temp files may end
+      up filling a disk. The new auditor functionality will reap these
+      rsync temp files if they are old. The new object-auditor config
+      variable `rsync_tempfile_timeout` is the number of seconds old a
+      tempfile must be before it is reaped. By default, this variable
+      is set to "auto" or the rsync_timeout plus 900 seconds (falling
+      back to a value of 1 day).
+
+    * The Erasure Code reconstruction process has been made more
+      efficient by not syncing data files when only the durable commit
+      file is missing.
+
+    * Fixed a bug where 304 and 416 response may not have the right
+      Etag and Accept-Ranges headers when the object is stored in an
+      Erasure Coded policy.
+
+    * Versioned writes now correctly stores the date of previous versions
+      using GMT instead of local time.
+
+    * The deprecated Keystone middleware option is_admin has been removed.
+
+    * Fixed log format in object auditor.
+
+    * The zero-byte mode (ZBF) of the object auditor will now properly
+      observe the `--once` option.
+
+    * Swift keeps track, internally, of "dirty" parts of the partition
+      keyspace with a "hashes.pkl" file. Operations on this file no
+      longer require a read-modify-write cycle and use a new
+      "hashes.invalid" file to track dirty partitions. This change
+      will improve end-user performance for PUT and DELETE operations.
+
+    * The object replicator's succeeded and failed counts are now logged.
+
+    * `swift-recon` can now query hosts by storage policy.
+
+    * The log_statsd_host value can now be an IPv6 address or a hostname
+      which only resolves to an IPv6 address.
+
+    * Erasure coded fragments now properly call fallocate to reserve disk
+      space before being written.
+
+    * Various other minor bug fixes and improvements.
+
 swift (2.6.0)
 
     * Dependency changes
